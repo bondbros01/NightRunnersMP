@@ -5,3 +5,6 @@ Phase 1 is done:
 
 Phase 2:
 Opponent Object Spawner.
+
+Phase 3
+Lobby UI
