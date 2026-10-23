@@ -1,0 +1,458 @@
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using BepInEx;
+using BepInEx.Logging;
+using Il2CppInterop.Runtime;
+using Il2CppInterop.Runtime.Injection;
+using Steamworks;
+using UnityEngine;
+using UnityStandardAssets.Vehicles.Car;
+
+namespace NightrunnersMP
+{
+    [BepInPlugin("com.nightrunners.multiplayer.p2p", "Nightrunners P2P Multiplayer", "2.0.0")]
+    public class NightrunnersMPPlugin : BepInEx.Unity.IL2CPP.BasePlugin
+    {
+        internal static new ManualLogSource Log;
+
+        public override void Load()
+        {
+            Log = base.Log;
+            Log.LogInfo("Initializing Nightrunners P2P Multiplayer (Phase 2)...");
+
+            // Register custom MonoBehaviour types into the IL2CPP runtime domain
+            ClassInjector.RegisterTypeInIl2Cpp<NetworkVehicleTicker>();
+            // Instantiate persistent root GameObject for the network engine
+            GameObject tickerHolder = new GameObject("Nightrunners_NetworkVehicleTicker");
+            tickerHolder.hideFlags = HideFlags.HideAndDontSave;
+            UnityEngine.Object.DontDestroyOnLoad(tickerHolder);
+
+            // Safe IL2CPP AddComponent using explicit Il2CppType and casting
+            tickerHolder.AddComponent(Il2CppType.Of<NetworkVehicleTicker>()).TryCast<NetworkVehicleTicker>();
+
+            Log.LogInfo("Nightrunners P2P Multiplayer Phase 2 Loaded Successfully.");
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct CarNetworkPacket
+    {
+        public byte PacketHeader;
+        public uint SequenceId;
+        public float Timestamp;
+        public float PositionX;
+        public float PositionY;
+        public float PositionZ;
+        public float RotationX;
+        public float RotationY;
+        public float RotationZ;
+        public float RotationW;
+        public float VelocityX;
+        public float VelocityY;
+        public float VelocityZ;
+        public float SteerAngle;
+        public float Revs;
+        public float BrakeInput;
+        public byte Skidding;
+    }
+
+    public static class RemotePlayerManager
+    {
+        private static readonly Dictionary<ulong, RemoteCarInterpolator> RemotePlayers = new Dictionary<ulong, RemoteCarInterpolator>();
+
+        public static void ProcessIncomingPacket(CSteamID senderSteamId, in CarNetworkPacket packet, GameObject localVehicleTemplate)
+        {
+            ulong steamId64 = senderSteamId.m_SteamID;
+
+            if (!RemotePlayers.TryGetValue(steamId64, out RemoteCarInterpolator interpolator) || interpolator == null)
+            {
+                if (localVehicleTemplate == null) return;
+
+                interpolator = SpawnGhostVehicle(senderSteamId, localVehicleTemplate, packet);
+                if (interpolator != null)
+                {
+                    RemotePlayers[steamId64] = interpolator;
+                }
+                return;
+            }
+
+            interpolator.UpdateTargetState(packet);
+        }
+
+        private static RemoteCarInterpolator SpawnGhostVehicle(CSteamID senderSteamId, GameObject localVehicleTemplate, in CarNetworkPacket initialPacket)
+        {
+            NightrunnersMPPlugin.Log.LogInfo("Spawning new Ghost Vehicle for remote Steam ID: " + senderSteamId.m_SteamID);
+
+            Vector3 spawnPosition = new Vector3(initialPacket.PositionX, initialPacket.PositionY, initialPacket.PositionZ);
+            Quaternion spawnRotation = new Quaternion(initialPacket.RotationX, initialPacket.RotationY, initialPacket.RotationZ, initialPacket.RotationW);
+
+            GameObject ghostCar = UnityEngine.Object.Instantiate(localVehicleTemplate, spawnPosition, spawnRotation);
+            ghostCar.name = "GhostVehicle_" + senderSteamId.m_SteamID;
+            ghostCar.tag = "Untagged";
+
+            // Strip audio components string-safely to bypass missing references
+            var allComponents = ghostCar.GetComponentsInChildren(Il2CppType.Of<Component>());
+            for (int i = 0; i < allComponents.Length; i++)
+            {
+                Component comp = allComponents[i];
+                if (comp != null && (comp.GetIl2CppType().Name.Contains("AudioListener") || comp.GetIl2CppType().Name.Contains("CarAudio")))
+                {
+                    UnityEngine.Object.Destroy(comp);
+                }
+            }
+
+            // Neutralize local input control scripts string-safely
+            Component userControl = ghostCar.GetComponent("CarUserControl");
+            if (userControl != null) UnityEngine.Object.Destroy(userControl);
+
+            CarController carController = ghostCar.GetComponent<CarController>();
+            Transform frontLeftWheelTransform = null;
+            Transform frontRightWheelTransform = null;
+
+            if (carController != null)
+            {
+                carController.enabled = false;
+                UnityEngine.Object.Destroy(carController);
+            }
+
+            // Fallback wheel mesh discovery crawling the visual asset hierarchy
+            Transform[] allChildren = ghostCar.GetComponentsInChildren<Transform>();
+            for (int i = 0; i < allChildren.Length; i++)
+            {
+                Transform t = allChildren[i];
+                string lowerName = t.name.ToLower();
+                if (frontLeftWheelTransform == null && (lowerName.Contains("wheel_fl") || lowerName.Contains("wheel_l_front") || lowerName.Contains("fl_wheel")))
+                {
+                    frontLeftWheelTransform = t;
+                }
+                else if (frontRightWheelTransform == null && (lowerName.Contains("wheel_fr") || lowerName.Contains("wheel_r_front") || lowerName.Contains("fr_wheel")))
+                {
+                    frontRightWheelTransform = t;
+                }
+            }
+
+            Rigidbody rb = ghostCar.GetComponent<Rigidbody>();
+            if (rb != null)
+            {
+                rb.isKinematic = true;
+                rb.useGravity = false;
+                rb.velocity = Vector3.zero;
+                rb.angularVelocity = Vector3.zero;
+            }
+
+            // Disable physical wheel colliders safely via a string-based behaviour loop
+            for (int i = 0; i < allComponents.Length; i++)
+            {
+                Component comp = allComponents[i];
+                if (comp != null && comp.GetIl2CppType().Name.Contains("WheelCollider"))
+                {
+                    Behaviour behaviourComp = comp.TryCast<Behaviour>();
+                    if (behaviourComp != null) behaviourComp.enabled = false;
+                }
+            }
+
+            // Setup dedicated 3D AudioSource for engine noise
+            AudioSource engineAudio = ghostCar.GetComponentInChildren<AudioSource>();
+            if (engineAudio == null)
+            {
+                engineAudio = ghostCar.AddComponent(Il2CppType.Of<AudioSource>()).TryCast<AudioSource>();
+            }
+            if (engineAudio != null)
+            {
+                engineAudio.spatialBlend = 1.0f;
+                engineAudio.minDistance = 3.0f;
+                engineAudio.maxDistance = 60.0f;
+                engineAudio.loop = true;
+                if (engineAudio.clip != null && !engineAudio.isPlaying)
+                {
+                    engineAudio.Play();
+                }
+            }
+
+            // Attach the state interpolation driver via standard IL2CPP formatting
+            RemoteCarInterpolator interpolator = ghostCar.AddComponent(Il2CppType.Of<RemoteCarInterpolator>()).TryCast<RemoteCarInterpolator>();
+            if (interpolator != null)
+            {
+                interpolator.Initialize(frontLeftWheelTransform, frontRightWheelTransform, engineAudio);
+                interpolator.UpdateTargetState(initialPacket);
+            }
+
+            return interpolator;
+        }
+
+        public static void RemovePlayer(ulong steamId64)
+        {
+            if (RemotePlayers.TryGetValue(steamId64, out RemoteCarInterpolator interpolator))
+            {
+                if (interpolator != null && interpolator.gameObject != null)
+                {
+                    UnityEngine.Object.Destroy(interpolator.gameObject);
+                }
+                RemotePlayers.Remove(steamId64);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Smooths spatial position, dead reckoning vectors, and front wheel steering animations.
+    /// </summary>
+    public class RemoteCarInterpolator : MonoBehaviour
+    {
+        public RemoteCarInterpolator(IntPtr ptr) : base(ptr) { }
+
+        private Vector3 _targetPosition;
+        private Quaternion _targetRotation;
+        private Vector3 _targetVelocity;
+        private float _targetSteerAngle;
+        private float _currentSteerAngle;
+        private float _targetRevs;
+        private float _currentRevs;
+
+        private Transform _frontLeftWheel;
+        private Transform _frontRightWheel;
+        private Quaternion _flBaseRotation;
+        private Quaternion _frBaseRotation;
+        private AudioSource _engineAudio;
+        private uint _lastSequence;
+
+        private const float PositionLerpFactor = 15.0f;
+        private const float RotationSlerpFactor = 15.0f;
+        private const float TeleportThreshold = 25.0f;
+
+        public void Initialize(Transform frontLeft, Transform frontRight, AudioSource audio)
+        {
+            _frontLeftWheel = frontLeft;
+            _frontRightWheel = frontRight;
+            _engineAudio = audio;
+
+            if (_frontLeftWheel != null) _flBaseRotation = _frontLeftWheel.localRotation;
+            if (_frontRightWheel != null) _frBaseRotation = _frontRightWheel.localRotation;
+
+            _targetPosition = transform.position;
+            _targetRotation = transform.rotation;
+        }
+
+        public void UpdateTargetState(in CarNetworkPacket packet)
+        {
+            if (packet.SequenceId < _lastSequence && (_lastSequence - packet.SequenceId) < 1000) return;
+            _lastSequence = packet.SequenceId;
+
+            _targetPosition = new Vector3(packet.PositionX, packet.PositionY, packet.PositionZ);
+            _targetRotation = new Quaternion(packet.RotationX, packet.RotationY, packet.RotationZ, packet.RotationW);
+            _targetVelocity = new Vector3(packet.VelocityX, packet.VelocityY, packet.VelocityZ);
+            _targetSteerAngle = packet.SteerAngle;
+            _targetRevs = packet.Revs;
+
+            if (Vector3.Distance(transform.position, _targetPosition) > TeleportThreshold)
+            {
+                transform.position = _targetPosition;
+                transform.rotation = _targetRotation;
+            }
+        }
+
+        private void Update()
+        {
+            float dt = Time.deltaTime;
+
+            // Dead-reckoned target point extrapolation
+            Vector3 extrapolatedPosition = _targetPosition + (_targetVelocity * dt);
+
+            // Spatial Interpolation
+            transform.position = Vector3.Lerp(transform.position, extrapolatedPosition, dt * PositionLerpFactor);
+            transform.rotation = Quaternion.Slerp(transform.rotation, _targetRotation, dt * RotationSlerpFactor);
+
+            // Interpolate internal telemetry
+            _currentSteerAngle = Mathf.Lerp(_currentSteerAngle, _targetSteerAngle, dt * 15.0f);
+            _currentRevs = Mathf.Lerp(_currentRevs, _targetRevs, dt * 8.0f);
+
+            // Animate Front Steering Wheel Meshes
+            Quaternion steerOffset = Quaternion.Euler(0.0f, _currentSteerAngle, 0.0f);
+            if (_frontLeftWheel != null)
+            {
+                _frontLeftWheel.localRotation = _flBaseRotation * steerOffset;
+            }
+            if (_frontRightWheel != null)
+            {
+                _frontRightWheel.localRotation = _frBaseRotation * steerOffset;
+            }
+
+            // Modulate Engine Sound Telemetry
+            if (_engineAudio != null)
+            {
+                float clampedRevs = Mathf.Clamp01(_currentRevs);
+                _engineAudio.pitch = Mathf.Lerp(0.75f, 2.2f, clampedRevs);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Static networking manager handled entirely on the managed C# side.
+    /// This keeps byte arrays completely hidden from the IL2CPP class inspector.
+    /// </summary>
+    public static class SteamNetworkManager
+    {
+        public static void DispatchToSteamP2P(byte[] payload, int size)
+        {
+            if (!SteamAPI.Init()) return;
+
+            CSteamID currentLobby = SteamMatchmaking.GetLobbyOwner(SteamMatchmaking.GetLobbyByIndex(0));
+            if (!currentLobby.IsValid()) return;
+
+            int memberCount = SteamMatchmaking.GetNumLobbyMembers(currentLobby);
+            CSteamID localSteamId = SteamUser.GetSteamID();
+
+            for (int i = 0; i < memberCount; i++)
+            {
+                CSteamID memberId = SteamMatchmaking.GetLobbyMemberByIndex(currentLobby, i);
+                if (memberId == localSteamId || !memberId.IsValid()) continue;
+
+                SteamNetworking.SendP2PPacket(memberId, payload, (uint)size, EP2PSend.k_EP2PSendUnreliableNoDelay, 0);
+            }
+        }
+
+        public static unsafe void ReceiveIncomingPackets(byte[] receiveBuffer, int packetSizeTarget, GameObject localVehicleTemplate)
+        {
+            if (!SteamAPI.Init()) return;
+
+            uint packetSize;
+            while (SteamNetworking.IsP2PPacketAvailable(out packetSize, 0))
+            {
+                if (packetSize == (uint)packetSizeTarget)
+                {
+                    uint bytesRead;
+                    CSteamID remoteSteamId;
+
+                    if (SteamNetworking.ReadP2PPacket(receiveBuffer, packetSize, out bytesRead, out remoteSteamId, 0))
+                    {
+                        fixed (byte* ptr = receiveBuffer)
+                        {
+                            CarNetworkPacket packet = *(CarNetworkPacket*)ptr;
+                            if (packet.PacketHeader == 0x01)
+                            {
+                                RemotePlayerManager.ProcessIncomingPacket(remoteSteamId, in packet, localVehicleTemplate);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    byte[] discardBuffer = new byte[packetSize];
+                    SteamNetworking.ReadP2PPacket(discardBuffer, packetSize, out _, out _, 0);
+                }
+            }
+        }
+    }
+
+
+
+    /// <summary>
+    /// Ticker managing local telemetry serialization transmission and incoming Steam P2P polling.
+    /// </summary>
+    public class NetworkVehicleTicker : MonoBehaviour
+    {
+        public NetworkVehicleTicker(IntPtr ptr) : base(ptr) { }
+
+        private CarController _localCarController;
+        private Rigidbody _localRigidbody;
+        private uint _packetSequenceCounter;
+
+        private static readonly int PacketSize = Marshal.SizeOf<CarNetworkPacket>();
+        private readonly byte[] _sendBuffer = new byte[PacketSize];
+        private readonly byte[] _receiveBuffer = new byte[PacketSize];
+
+        private float _nextScanTime;
+        private const float ScanInterval = 1.0f;
+
+        private float _nextTickTime;
+        private const float NetworkSendRate = 1.0f / 30.0f;
+
+        private void Update()
+        {
+            // 1. Maintain local player vehicle discovery
+            if (_localCarController == null || _localRigidbody == null)
+            {
+                if (Time.unscaledTime >= _nextScanTime)
+                {
+                    _nextScanTime = Time.unscaledTime + ScanInterval;
+                    LocateLocalPlayerVehicle();
+                }
+            }
+
+            // 2. Poll & Process incoming remote packets safely via the static manager
+            GameObject template = _localCarController != null ? _localCarController.gameObject : null;
+            SteamNetworkManager.ReceiveIncomingPackets(_receiveBuffer, PacketSize, template);
+
+            // 3. Broadcast local vehicle telemetry
+            if (_localCarController != null && _localRigidbody != null && Time.unscaledTime >= _nextTickTime)
+            {
+                _nextTickTime = Time.unscaledTime + NetworkSendRate;
+                BroadcastVehicleState();
+            }
+        }
+
+        private void LocateLocalPlayerVehicle()
+        {
+            CarController[] allCars = UnityEngine.Object.FindObjectsOfType<CarController>();
+            if (allCars == null || allCars.Length == 0) return;
+
+            for (int i = 0; i < allCars.Length; i++)
+            {
+                CarController car = allCars[i];
+                if (car == null || car.gameObject.name.StartsWith("GhostVehicle_")) continue;
+
+                Component userControl = car.GetComponent("CarUserControl");
+                bool hasPlayerTag = car.CompareTag("Player") || car.transform.root.CompareTag("Player");
+                bool isCameraTarget = Camera.main != null && Camera.main.transform.parent != null &&
+                                     Camera.main.transform.parent.root == car.transform.root;
+
+                if (userControl != null || hasPlayerTag || isCameraTarget)
+                {
+                    _localCarController = car;
+                    _localRigidbody = car.GetComponent(Il2CppInterop.Runtime.Il2CppType.Of<Rigidbody>()).TryCast<Rigidbody>();
+                    break;
+                }
+            }
+        }
+
+
+        private unsafe void BroadcastVehicleState()
+        {
+            Vector3 pos = _localRigidbody.position;
+            Quaternion rot = _localRigidbody.rotation;
+            Vector3 vel = _localRigidbody.velocity;
+
+            CarNetworkPacket packet = new CarNetworkPacket
+            {
+                PacketHeader = 0x01,
+                SequenceId = ++_packetSequenceCounter,
+                Timestamp = Time.unscaledTime,
+
+                PositionX = pos.x,
+                PositionY = pos.y,
+                PositionZ = pos.z,
+
+                RotationX = rot.x,
+                RotationY = rot.y,
+                RotationZ = rot.z,
+                RotationW = rot.w,
+
+                VelocityX = vel.x,
+                VelocityY = vel.y,
+                VelocityZ = vel.z,
+
+                SteerAngle = _localCarController.CurrentSteerAngle,
+                Revs = _localCarController.Revs,
+                BrakeInput = _localCarController.BrakeInput,
+                Skidding = (byte)(_localCarController.Skidding ? 1 : 0)
+            };
+
+            fixed (byte* bufferPtr = _sendBuffer)
+            {
+                *(CarNetworkPacket*)bufferPtr = packet;
+            }
+
+            SteamNetworkManager.DispatchToSteamP2P(_sendBuffer, PacketSize);
+        }
+    }
+}
