@@ -1,0 +1,215 @@
+using System;
+using System.Runtime.InteropServices;
+using BepInEx;
+using BepInEx.Logging;
+using BepInEx.Unity.IL2CPP;
+using Il2CppInterop.Runtime.Injection;
+using Steamworks;
+using UnityEngine;
+using UnityStandardAssets.Vehicles.Car;
+
+namespace NightrunnersMP
+{
+    [BepInPlugin("com.nightrunners.multiplayer.p2p", "Nightrunners P2P Multiplayer", "1.0.0")]
+    public class NightrunnersMPPlugin : BasePlugin
+    {
+        internal static new ManualLogSource Log;
+
+        public override void Load()
+        {
+            Log = base.Log;
+            Log.LogInfo("Initializing Nightrunners P2P Multiplayer Plugin...");
+
+            // Register custom MonoBehaviour type into the IL2CPP domain
+            ClassInjector.RegisterTypeInIl2Cpp<NetworkVehicleTicker>();
+
+            // Instantiate persistent root GameObject for the network update loop
+            GameObject tickerHolder = new GameObject("Nightrunners_NetworkVehicleTicker");
+            tickerHolder.hideFlags = HideFlags.HideAndDontSave;
+            UnityEngine.Object.DontDestroyOnLoad(tickerHolder);
+            tickerHolder.AddComponent<NetworkVehicleTicker>();
+
+            Log.LogInfo("Nightrunners P2P Multiplayer Plugin Loaded successfully.");
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct CarNetworkPacket
+    {
+        public byte PacketHeader;
+        public uint SequenceId;
+        public float Timestamp;
+        public float PositionX;
+        public float PositionY;
+        public float PositionZ;
+        public float RotationX;
+        public float RotationY;
+        public float RotationZ;
+        public float RotationW;
+        public float VelocityX;
+        public float VelocityY;
+        public float VelocityZ;
+        public float SteerAngle;
+        public float Revs;
+        public float BrakeInput;
+        public byte Skidding;
+    }
+
+    /// <summary>
+    /// Static networking manager handled entirely on the managed C# side.
+    /// This keeps byte arrays completely hidden from the IL2CPP class inspector.
+    /// </summary>
+    public static class SteamNetworkManager
+    {
+        public static void DispatchToSteamP2P(byte[] payload, int size)
+        {
+            if (!SteamAPI.Init()) return;
+
+            CSteamID currentLobby = SteamMatchmaking.GetLobbyByIndex(0);
+            if (currentLobby == CSteamID.Nil) return;
+
+            int memberCount = SteamMatchmaking.GetNumLobbyMembers(currentLobby);
+            CSteamID localPlayerId = SteamUser.GetSteamID();
+
+            for (int i = 0; i < memberCount; i++)
+            {
+                CSteamID memberId = SteamMatchmaking.GetLobbyMemberByIndex(currentLobby, i);
+                if (memberId != localPlayerId)
+                {
+                    SteamNetworking.SendP2PPacket(memberId, payload, (uint)size, EP2PSend.k_EP2PSendUnreliableNoDelay, 0);
+                }
+            }
+        }
+
+        public static unsafe void ReceiveIncomingPackets(int packetSizeTarget)
+        {
+            if (!SteamAPI.Init()) return;
+
+            uint packetSize;
+            while (SteamNetworking.IsP2PPacketAvailable(out packetSize, 0))
+            {
+                byte[] inBuffer = new byte[packetSize];
+                CSteamID remoteSteamId;
+
+                if (SteamNetworking.ReadP2PPacket(inBuffer, packetSize, out packetSize, out remoteSteamId, 0))
+                {
+                    if (packetSize < packetSizeTarget) continue;
+
+                    fixed (byte* ptr = inBuffer)
+                    {
+                        CarNetworkPacket receivedPacket = *(CarNetworkPacket*)ptr;
+                        if (receivedPacket.PacketHeader == 0x01)
+                        {
+                            // Network packet received successfully! 
+                            // Soon we will pipe this data into a Ghost Car Spawner.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public class NetworkVehicleTicker : MonoBehaviour
+    {
+        public NetworkVehicleTicker(IntPtr ptr) : base(ptr) { }
+
+        private CarController _localCarController;
+        private Rigidbody _localRigidbody;
+        private uint _packetSequenceCounter;
+
+        private static readonly int PacketSize = Marshal.SizeOf<CarNetworkPacket>();
+        private readonly byte[] _networkBuffer = new byte[PacketSize];
+
+        private float _nextScanTime;
+        private const float ScanInterval = 1.0f;
+
+        private float _nextTickTime;
+        private const float NetworkSendRate = 1.0f / 30.0f;
+
+        private void Update()
+        {
+            // Call the static helper class to check for incoming data packets safely
+            SteamNetworkManager.ReceiveIncomingPackets(PacketSize);
+
+            if (_localCarController == null || _localRigidbody == null)
+            {
+                if (Time.unscaledTime >= _nextScanTime)
+                {
+                    _nextScanTime = Time.unscaledTime + ScanInterval;
+                    LocateLocalPlayerVehicle();
+                }
+                return;
+            }
+
+            if (Time.unscaledTime >= _nextTickTime)
+            {
+                _nextTickTime = Time.unscaledTime + NetworkSendRate;
+                BroadcastVehicleState();
+            }
+        }
+
+        private void LocateLocalPlayerVehicle()
+        {
+            CarController[] allCars = UnityEngine.Object.FindObjectsOfType<CarController>();
+            if (allCars == null || allCars.Length == 0) return;
+
+            for (int i = 0; i < allCars.Length; i++)
+            {
+                CarController car = allCars[i];
+                if (car == null) continue;
+
+                Component userControl = car.GetComponent("CarUserControl");
+                bool hasPlayerTag = car.CompareTag("Player") || car.transform.root.CompareTag("Player");
+                bool isCameraTarget = Camera.main != null && Camera.main.transform.parent != null &&
+                                     Camera.main.transform.parent.root == car.transform.root;
+
+                if (userControl != null || hasPlayerTag || isCameraTarget)
+                {
+                    _localCarController = car;
+                    _localRigidbody = car.GetComponent<Rigidbody>();
+                    NightrunnersMPPlugin.Log.LogInfo("Local player car resolved successfully: " + car.gameObject.name);
+                    break;
+                }
+            }
+        }
+
+        private unsafe void BroadcastVehicleState()
+        {
+            if (_localCarController == null || _localRigidbody == null) return;
+
+            // Use public properties instead of private fields to maintain stability
+            Vector3 pos = _localRigidbody.position;
+            Quaternion rot = _localRigidbody.rotation;
+            Vector3 vel = _localRigidbody.velocity;
+
+            CarNetworkPacket packet = new CarNetworkPacket
+            {
+                PacketHeader = 0x01,
+                SequenceId = ++_packetSequenceCounter,
+                Timestamp = Time.unscaledTime,
+                PositionX = pos.x,
+                PositionY = pos.y,
+                PositionZ = pos.z,
+                RotationX = rot.x,
+                RotationY = rot.y,
+                RotationZ = rot.z,
+                RotationW = rot.w,
+                VelocityX = vel.x,
+                VelocityY = vel.y,
+                VelocityZ = vel.z,
+                SteerAngle = _localCarController.CurrentSteerAngle,
+                Revs = _localCarController.Revs,
+                BrakeInput = _localCarController.BrakeInput,
+                Skidding = (byte)(_localCarController.Skidding ? 1 : 0)
+            };
+
+            fixed (byte* bufferPtr = _networkBuffer)
+            {
+                *(CarNetworkPacket*)bufferPtr = packet;
+            }
+
+            // Route through our new static manager to avoid IL2CPP parameter analysis
+            SteamNetworkManager.DispatchToSteamP2P(_networkBuffer, PacketSize);
+        }
+    }
+}
